@@ -38,6 +38,11 @@ def save_checkpoint(engine, save_dir: str, tag: Optional[str] = None) -> str:
     ckpt_dir = os.path.join(save_dir, tag)
     os.makedirs(ckpt_dir, exist_ok=True)
 
+    # stage 3: params live as 1/N slices between steps — all-gather them so
+    # rank 0 can write a full model state (no-op for stages 0-2).
+    was_gathered = engine.optimizer.params_gathered
+    engine.optimizer.gather_parameters()
+
     # Model architecture + weights: rank 0 only (identical on all ranks).
     if engine.rank == 0:
         torch.save(
@@ -61,6 +66,8 @@ def save_checkpoint(engine, save_dir: str, tag: Optional[str] = None) -> str:
     }
     torch.save(state, os.path.join(ckpt_dir, _optim_states_name(engine.rank)))
     comm.barrier()
+    if not was_gathered:
+        engine.optimizer.free_parameters()  # stage 3: back to shards
     return ckpt_dir
 
 
@@ -70,6 +77,10 @@ def load_checkpoint(
 ) -> Tuple[str, dict]:
     tag = tag or _read_latest(load_dir)
     ckpt_dir = os.path.join(load_dir, tag)
+
+    # stage 3: load_state_dict needs full-shaped params (no-op for stages 0-2)
+    was_gathered = engine.optimizer.params_gathered
+    engine.optimizer.gather_parameters()
 
     # 1) model weights (all ranks read the same file)
     model_path = os.path.join(ckpt_dir, MODEL_STATES)
@@ -96,7 +107,14 @@ def load_checkpoint(
         g.data.copy_(buf)
         g.copy_flat_to_model()
 
-    # 4) optimizer / scheduler / scaler / counters
+    # 4) stage 3: rebuild the params from the restored masters and return the
+    #    parameters to their pre-load state (freed, or gathered if they were)
+    if engine.config.zero_stage >= 3:
+        engine.optimizer.free_parameters()
+        if was_gathered:
+            engine.optimizer.gather_parameters()
+
+    # 5) optimizer / scheduler / scaler / counters
     engine.optimizer.load_state_dict(state["optimizer"])
     engine.lr_scheduler.load_state_dict(state["lr_scheduler"])
     engine.loss_scaler.load_state_dict(state["loss_scaler"])

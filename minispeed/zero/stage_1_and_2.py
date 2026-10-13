@@ -9,6 +9,8 @@ stage 1       full grads all-reduced, optimizer state partitioned, params
               all-gathered after every step
 stage 2       gradients reduce-scattered (each rank owns 1/N of the grad
               vector), optimizer state partitioned, params all-gathered
+stage 3       like stage 2 for gradients/optimizer state, but parameters
+              are partitioned too — see :mod:`minispeed.zero.stage_3`
 ============= =============================================================
 """
 
@@ -30,7 +32,7 @@ class ZeROOptimizer:
         option_groups: List[dict],
         zero_stage: int = 0,
     ):
-        if zero_stage not in (0, 1, 2):
+        if zero_stage not in (0, 1, 2, 3):
             raise ValueError(f"Unsupported ZeRO stage: {zero_stage}")
         self.flat_groups = flat_groups
         self.zero_stage = zero_stage
@@ -38,9 +40,11 @@ class ZeROOptimizer:
         self.rank = comm.get_rank()
         self.adam = FlatAdam(flat_groups, option_groups, zero_stage=zero_stage)
         self.grad_norm: float | None = None
-        # cached all-gather destination buffers (one per group)
+        # cached all-gather destination buffers (one per group); stage 3 never
+        # gathers masters into a full buffer — it gathers params instead
         self._gather_bufs = [
-            torch.empty_like(g.data) if (zero_stage >= 1 and self.world_size > 1)
+            torch.empty_like(g.data)
+            if (1 <= zero_stage <= 2 and self.world_size > 1)
             else None
             for g in flat_groups
         ]
@@ -57,6 +61,26 @@ class ZeROOptimizer:
     def zero_grad(self) -> None:
         for g in self.flat_groups:
             g.zero_grad()
+
+    # --------------------------------------------- parameter materialization
+    @property
+    def params_gathered(self) -> bool:
+        """Stages 0-2 keep full parameters resident, so they are always gathered."""
+        return True
+
+    @torch.no_grad()
+    def gather_parameters(self) -> None:
+        """ZeRO-3 hook: all-gather master shards into full params (no-op here)."""
+
+    @torch.no_grad()
+    def free_parameters(self) -> None:
+        """ZeRO-3 hook: params -> local partitions (no-op for stages 0-2)."""
+
+    @torch.no_grad()
+    def sync_parameters(self) -> None:
+        """Push updated masters into the model parameters after :meth:`step`."""
+        for g in self.flat_groups:
+            g.copy_flat_to_model()
 
     # ------------------------------------------------------------ reduction
     @torch.no_grad()
@@ -128,4 +152,4 @@ class ZeROOptimizer:
         self.adam.load_state_dict(state)
 
     def _grad_device(self) -> torch.device:
-        return self.flat_groups[0].grad.device
+        return self.flat_groups[0].data.device

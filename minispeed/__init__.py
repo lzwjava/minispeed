@@ -3,7 +3,7 @@
 Implements the core of DeepSpeed in a few thousand lines of readable PyTorch:
 
   * :class:`~minispeed.engine.DeepSpeedEngine`  — the training engine
-  * ZeRO stages 1 & 2 (optimizer-state / gradient sharding + param all-gather)
+  * ZeRO stages 1-3 (optimizer-state / gradient / parameter sharding)
   * fp16/bf16 mixed precision with fp32 master weights + dynamic loss scaling
   * gradient accumulation, global gradient clipping, inf/nan skip
   * DeepSpeed-style WarmupDecayLR schedulers and sharded checkpoints

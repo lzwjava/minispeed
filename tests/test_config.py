@@ -39,11 +39,34 @@ def test_fp16_and_bf16_conflict():
 
 def test_zero_stage_validation():
     assert DeepSpeedConfig({"zero_optimization": {"stage": 1}}).zero_stage == 1
+    assert DeepSpeedConfig({"zero_optimization": {"stage": 3}}).zero_stage == 3
     with pytest.raises(ConfigError):
-        DeepSpeedConfig({"zero_optimization": {"stage": 3}})
+        DeepSpeedConfig({"zero_optimization": {"stage": 4}})
     with pytest.raises(ConfigError):
         DeepSpeedConfig(
             {"zero_optimization": {"stage": 1, "offload_optimizer": {"device": "cpu"}}}
+        )
+
+
+def test_stage3_gather_flag_must_stay_enabled():
+    cfg = DeepSpeedConfig(
+        {
+            "zero_optimization": {
+                "stage": 3,
+                "stage3_gather_16bit_weights_on_model_save": True,
+            }
+        }
+    )
+    assert cfg.zero_stage == 3
+    # minispeed's checkpoint layout stores a full model state on save
+    with pytest.raises(ConfigError):
+        DeepSpeedConfig(
+            {
+                "zero_optimization": {
+                    "stage": 3,
+                    "stage3_gather_16bit_weights_on_model_save": False,
+                }
+            }
         )
 
 

@@ -4,8 +4,9 @@ World size 2 on gloo/CPU: each rank trains on its own shard of every batch,
 the framework all-reduces (or reduce-scatters) gradients, and the resulting
 trajectory must match a single-process run on the union of the shards.
 
-ZeRO stage 0 (plain DP), stage 1 (optimizer-state sharding) and stage 2
-(+ gradient sharding) must all be bit-for-bit equivalent within fp32 noise.
+ZeRO stage 0 (plain DP), stage 1 (optimizer-state sharding), stage 2
+(+ gradient sharding) and stage 3 (+ parameter sharding) must all be
+bit-for-bit equivalent within fp32 noise.
 """
 
 import os
@@ -44,6 +45,10 @@ def _worker(rank, world_size, stage, port, tmpdir, dtype):
     x_r = x[:, :, rank * MICRO : (rank + 1) * MICRO, :]
     y_r = y[:, :, rank * MICRO : (rank + 1) * MICRO, :]
     losses = train_engine(engine, x_r, y_r, STEPS, GAS, MICRO, device="cpu")
+
+    # stage 3: params live as 1/N slices between steps — gather to read them
+    if stage >= 3:
+        engine.optimizer.gather_parameters()
 
     payload = {
         "losses": torch.tensor(losses),
@@ -91,7 +96,7 @@ def _run_reference():
     return ref_losses, ref_params
 
 
-@pytest.mark.parametrize("stage", [0, 1, 2])
+@pytest.mark.parametrize("stage", [0, 1, 2, 3])
 def test_distributed_matches_single_process(stage, tmp_path):
     port = free_port()
     torch.multiprocessing.spawn(
@@ -131,10 +136,10 @@ def test_distributed_matches_single_process(stage, tmp_path):
     assert rel_drift < 1e-3, f"relative param drift {rel_drift:.2e} too large"
 
 
-@pytest.mark.parametrize("stage", [0, 1, 2])
+@pytest.mark.parametrize("stage", [0, 1, 2, 3])
 def test_optimizer_state_sharding(stage, tmp_path):
     """stage 0: full state on every rank, identical across ranks.
-    stage 1/2: state partitioned in world_size equal shards, distinct per rank."""
+    stage 1/2/3: state partitioned in world_size equal shards, distinct per rank."""
     port = free_port()
     torch.multiprocessing.spawn(
         _worker,

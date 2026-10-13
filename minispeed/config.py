@@ -106,17 +106,21 @@ class DeepSpeedConfig:
         if zero is False:
             zero = {}
         self.zero_stage = int(zero.get("stage", 0))
-        if self.zero_stage not in (0, 1, 2):
+        if self.zero_stage not in (0, 1, 2, 3):
             raise ConfigError(
                 f"Unsupported zero stage {self.zero_stage} "
-                "(minispeed implements stages 0, 1 and 2)"
+                "(minispeed implements stages 0, 1, 2 and 3)"
             )
         if zero.get("offload_optimizer") or zero.get("offload_param"):
             raise ConfigError(
                 "CPU/NVMe offload is not implemented in minispeed"
             )
-        if zero.get("stage3_gather_16bit_weights_on_model_save"):
-            raise ConfigError("stage 3 options are not supported")
+        if zero.get("stage3_gather_16bit_weights_on_model_save") is False:
+            raise ConfigError(
+                "minispeed always gathers stage-3 parameters on checkpoint "
+                "save (its layout stores a full model state); set "
+                "stage3_gather_16bit_weights_on_model_save to true or omit it"
+            )
 
         # --- optimizer --------------------------------------------------------
         opt = raw.get("optimizer", {}) or {}

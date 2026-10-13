@@ -178,6 +178,9 @@ def _gloo_cuda_worker(rank, world_size, stage, port, tmpdir, dtype):
     x_r = x[:, :, rank * MICRO : (rank + 1) * MICRO, :]
     y_r = y[:, :, rank * MICRO : (rank + 1) * MICRO, :]
     losses = train_engine(engine, x_r, y_r, STEPS, GAS, MICRO, device=engine.device)
+    # stage 3: params live as 1/N slices between steps — gather to read them
+    if stage >= 3:
+        engine.optimizer.gather_parameters()
     torch.save(
         {"losses": torch.tensor(losses),
          "params": {k: v.clone() for k, v in model.state_dict().items()},
@@ -204,7 +207,7 @@ def _gpu_reference(dtype: str):
 WORLD = 2
 
 
-@pytest.mark.parametrize("stage", [0, 1, 2])
+@pytest.mark.parametrize("stage", [0, 1, 2, 3])
 @pytest.mark.parametrize("dtype", ["fp32", "fp16"])
 def test_two_ranks_one_gpu(stage, dtype, tmp_path):
     port = free_port()

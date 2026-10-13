@@ -29,17 +29,17 @@ for x, y in loader:
 | Data-parallel training (`torchrun`, NCCL / gloo) | ✅ |
 | ZeRO stage 1 (optimizer-state sharding) | ✅ |
 | ZeRO stage 2 (+ gradient sharding via reduce-scatter) | ✅ |
+| ZeRO stage 3 (+ parameter sharding, gather/free around compute) | ✅ |
 | fp16 + fp32 master weights + **dynamic loss scaling** | ✅ |
 | inf/nan gradient detection → skip step, halve scale | ✅ |
 | bf16 (no loss scaling) | ✅ |
 | Gradient accumulation (`train_micro_batch_size_per_gpu` × `gas`) | ✅ |
-| Global gradient clipping (exact global norm, even under ZeRO-2) | ✅ |
+| Global gradient clipping (exact global norm, even under ZeRO-2/3) | ✅ |
 | `WarmupLR` / `WarmupDecayLR` (DeepSpeed scheduler schema) | ✅ |
 | DeepSpeed-style JSON config | ✅ |
 | Sharded checkpoints (`global_stepN/`, `latest` pointer, resume) | ✅ |
 | Activation checkpointing helper | ✅ |
 | Timers (`engine.timers`) | ✅ |
-| ZeRO stage 3 (parameter sharding) | ❌ |
 | CPU / NVMe offload, pipeline parallel, compression | ❌ |
 
 ## Quickstart
@@ -50,6 +50,9 @@ pip install -e .            # or: pip install -e . --break-system-packages
 
 # single GPU, fp16 + ZeRO stage 2
 python examples/train_lm.py --dtype fp16 --zero 2
+
+# stage 3 shards the parameters too (gathered again for every forward)
+python examples/train_lm.py --dtype fp16 --zero 3
 
 # multi-process — minispeed picks NCCL when there is one GPU per rank,
 # and falls back to gloo (CUDA tensors) when ranks share a GPU
@@ -65,7 +68,7 @@ python examples/train_lm.py --config examples/ds_config.json --steps 50
 Tests (CPU + GPU, single- and multi-process):
 
 ```bash
-python -m pytest tests/ -q        # 36 passed, 2 skipped on a 1-GPU machine
+python -m pytest tests/ -q        # 44 passed, 2 skipped on a 1-GPU machine
 ```
 
 ## Configuration
@@ -88,12 +91,13 @@ The config schema is a subset of DeepSpeed's `ds_config.json`:
                    "params": { "warmup_min_lr": 0.0, "warmup_max_lr": 1e-3,
                                "warmup_num_steps": 100,
                                "total_num_steps": 1000 } },
-  "zero_optimization": { "stage": 2 }   // 0, 1 or 2
+  "zero_optimization": { "stage": 2 }   // 0, 1, 2 or 3
 }
 ```
 
-Invalid combinations (`stage: 3`, offload, fp16+bf16, inconsistent batch sizes)
-fail fast with a `ConfigError`.
+Invalid combinations (`stage: 4`, offload,
+`stage3_gather_16bit_weights_on_model_save: false`, fp16+bf16, inconsistent
+batch sizes) fail fast with a `ConfigError`.
 
 ## How it works
 
@@ -106,12 +110,16 @@ minispeed/
 ├── precision.py               DynamicLossScaler, inf/nan detection
 ├── checkpoint.py              sharded save/load (global_stepN + latest)
 ├── zero/stage_1_and_2.py      reduction, sharding, all-gather
+├── zero/stage_3.py            parameter partition + gather/free windows
 ├── optim/adam.py              AdamW over flat buffers + ZeRO shards
 ├── optim/scheduler.py         WarmupLR / WarmupDecayLR
 └── activation_checkpointing.py
 ```
 
-One training step (at a gradient-accumulation boundary):
+One training step (at a gradient-accumulation boundary; under stage 3 the
+first `engine(x)` of each window all-gathers the parameters — one collective
+per group — and the full flat gradient buffer exists only from flatten to
+reduce-scatter):
 
 ```
 micro-batches        loss × (1/gas) × loss_scale → backward()   [engine.backward]
@@ -120,15 +128,17 @@ boundary reached     1. flatten param.grad → fp32 flat buffer    (flat.py)
                      2. inf/nan? → one flag all-reduce            (precision.py)
                         └─ yes: halve scale, skip step, zero grads
                      3. grads /= loss_scale                       (unscale)
-                     4. stage 0/1: all-reduce + ÷ world   │ stage 2: reduce-scatter
+                     4. stage 0/1: all-reduce + ÷ world   │ stage 2/3: reduce-scatter
                      5. global grad norm → clip           │ (exact via SUM of
                         (stage 2: one SUM over shards)    │  shard sum-of-squares)
                      6. AdamW on this rank's shard  → stage ≥1: all-gather params
-                     7. fp32 master → model dtype (fp16/bf16)
+                        (stage 3: free them instead — re-gathered next forward)
+                     7. fp32 master → model dtype (fp16/bf16; stage 3 casts
+                        during the gather)
                      8. loss-scale window ↑, lr_scheduler.step(), zero grads
 ```
 
-### ZeRO in three lines
+### ZeRO in four lines
 
 * **stage 0** — all-reduce gradients; every rank keeps the full optimizer state.
 * **stage 1** — all-reduce gradients; `exp_avg`/`exp_avg_sq` cover only
@@ -137,6 +147,12 @@ boundary reached     1. flatten param.grad → fp32 flat buffer    (flat.py)
 * **stage 2** — same, but gradients are `reduce_scatter_tensor`ed, so each rank
   never materializes the full gradient. The global norm stays exact because the
   per-rank shard sums-of-squares are a partition of the whole gradient.
+* **stage 3** — parameters too: each rank only stores its 1/N slice of the fp32
+  masters, its Adam moments, its gradient shard (reduce-scattered as in stage
+  2) and a 1/N placeholder slice of every parameter. The full weights exist
+  only between `gather_parameters()` (first forward of a window) and
+  `free_parameters()` (after the optimizer step), so resident state per rank
+  is ~1/N of stages 0-2 outside compute.
 
 `numel` is padded to a multiple of `world_size` so shards are equal; all
 collectives operate **once per parameter group** (the flat buffer *is* the
@@ -157,14 +173,17 @@ The optimizer files carry the fp32 master weights, scheduler and loss-scaler
 state, so resume restores an *identical* trajectory (verified by
 `test_checkpoint_roundtrip_restores_training`). ZeRO shards are tied to the
 world size that wrote them — resuming with a different `world_size` raises.
+Saving under stage 3 all-gathers the parameters first (and frees them again
+afterwards); each rank's `fp32_groups` entry then holds only its master shard.
 
 ## Testing
 
 | Test file | What it proves |
 | --- | --- |
 | `test_engine.py` | engine trajectory ≡ plain `torch.optim.AdamW` loop; accumulation ≡ big batch; bf16; checkpoint replay; boundary semantics |
-| `test_distributed.py` | 2 ranks (gloo/CPU), stages 0/1/2 ≡ single-process run on the union batch; optimizer state really partitioned |
+| `test_distributed.py` | 2 ranks (gloo/CPU), stages 0/1/2/3 ≡ single-process run on the union batch; optimizer state really partitioned |
 | `test_gpu.py` | fp16 on GPU, loss-scale growth, forced-∞ skip (weights untouched), 2 ranks × 1 GPU (gloo/CUDA), NCCL ≥ 2 GPUs |
+| `test_zero3.py` | stage 3 ≡ stage 0; partition/gather/free lifecycle; overflow skip still frees params; sharded checkpoint replay |
 | `test_precision.py`, `test_config.py` | loss-scaler state machine, scheduler math, config validation |
 
 ## Environment variables
@@ -179,8 +198,13 @@ device defaults to `cuda:LOCAL_RANK` (clamped) when CUDA is visible, else CPU.
 
 ## Limitations
 
-* ZeRO stages 3+, optimizer/parameter offload, pipeline/tensor parallel,
+* ZeRO stage 4+, optimizer/parameter offload, pipeline/tensor parallel,
   compression and FP1 optimizer are intentionally out of scope.
+* Stage 3 gathers the whole model at once (one collective per parameter group)
+  instead of DeepSpeed's per-layer buckets + prefetch — the peak transient
+  cost at gather time is one full fp32 buffer per group.
+* Under stage 3, calling the raw `model(...)` between steps sees the
+  partitioned placeholders — go through `engine(...)`.
 * Sharded checkpoints require the same `world_size` to resume.
 * The optimizer is a single flat Adam/AdamW (one hyperparameter set per
   parameter group, as in `torch.optim`).

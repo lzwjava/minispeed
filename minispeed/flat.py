@@ -22,8 +22,12 @@ class FlatParamGroup:
 
     Buffers (all fp32, the master copy of the weights):
       - ``data``       full flat parameter buffer, size ``numel_padded``
-      - ``grad``       full flat gradient buffer (stages 0/1), size ``numel_padded``
-      - ``grad_shard`` reduce-scattered gradient shard (stage 2), size ``shard_size``
+                       (stage 3 after :meth:`partition_params`: this rank's
+                       shard only, size ``shard_size``)
+      - ``grad``       full flat gradient buffer (stages 0/1/2 while reducing;
+                       ``None`` in stage 3 outside an accumulation boundary —
+                       rebuilt for flatten + reduce-scatter, then dropped)
+      - ``grad_shard`` reduce-scattered gradient shard (stages 2/3), size ``shard_size``
 
     Sharding: ``numel_padded`` is divisible by world_size, rank ``r`` owns
     ``[r * shard_size, (r + 1) * shard_size)``.
@@ -55,34 +59,138 @@ class FlatParamGroup:
             self.shard_end = self.numel_padded
 
         self.data = torch.zeros(self.numel_padded, dtype=torch.float32, device=device)
-        self.grad = torch.zeros(self.numel_padded, dtype=torch.float32, device=device)
+        # stage 3 rebuilds the full grad buffer at every accumulation boundary
+        # and drops it again right after the reduce-scatter.
+        self.grad: torch.Tensor | None = (
+            None
+            if zero_stage >= 3
+            else torch.zeros(self.numel_padded, dtype=torch.float32, device=device)
+        )
         self.grad_shard: torch.Tensor | None = (
             torch.zeros(self.shard_size, dtype=torch.float32, device=device)
             if zero_stage >= 2
             else None
         )
 
-        # (flat_offset, parameter) lookup table
+        # (flat_offset, parameter) lookup table + original sizes. Sizes are
+        # cached because stage 3 temporarily replaces p.data with a smaller
+        # partition, after which p.numel() no longer describes the parameter.
         self._offsets: List[Tuple[int, nn.Parameter]] = []
+        self._numels: List[int] = []
+        self._shapes: List[Tuple[int, ...]] = []
         offset = 0
         for p in self.params:
             self._offsets.append((offset, p))
+            self._numels.append(p.numel())
+            self._shapes.append(tuple(p.shape))
             offset += p.numel()
 
+        # stage 3 flag: data has been reduced to this rank's shard
+        self._partitioned = False
+
+    @property
+    def master_range(self) -> Tuple[int, int]:
+        """Flat range covered by ``self.data`` (the fp32 master buffer).
+
+        stages 0-2 (and stage 3 before partitioning): the full buffer;
+        stage 3 after :meth:`partition_params`: this rank's shard.
+        """
+        if self._partitioned:
+            return self.shard_start, self.shard_end
+        return 0, self.numel_padded
+
     # ------------------------------------------------------------- conversions
-    @torch.no_grad()
-    def copy_model_to_flat(self) -> None:
-        """Snapshot model parameters into the fp32 master buffer."""
-        for offset, p in self._offsets:
-            n = p.numel()
-            self.data[offset : offset + n].copy_(p.data.reshape(-1))
+    def _pdata_range(self, offset: int, n: int, p: nn.Parameter) -> Tuple[int, int]:
+        """Global flat range covered by ``p.data``.
+
+        Full params (stages 0-2, stage 3 while gathered) cover the whole
+        parameter ``[offset, offset + n)``; a stage-3 placeholder covers only
+        the locally-owned slice ``[max(offset, shard_start), ...)``.
+        """
+        if p.data.numel() == n:
+            return offset, offset + n
+        start = max(offset, self.shard_start)
+        return start, start + p.data.numel()
 
     @torch.no_grad()
-    def copy_flat_to_model(self) -> None:
-        """Write the fp32 master buffer back into (possibly fp16) params."""
-        for offset, p in self._offsets:
-            n = p.numel()
-            p.data.copy_(self.data[offset : offset + n].view(p.data.shape))
+    def copy_model_to_flat(self) -> None:
+        """Snapshot model parameters into the fp32 master buffer.
+
+        Only the elements this buffer covers are written (the parameter ∩
+        ``master_range`` intersection), so for a stage-3 group this fills
+        exactly this rank's shard — from the full params while gathered, or
+        from the local placeholders while free.
+        """
+        ms, me = self.master_range
+        for (offset, p), n in zip(self._offsets, self._numels):
+            ps, pe = self._pdata_range(offset, n, p)
+            lo, hi = max(ps, ms), min(pe, me)
+            if lo >= hi:
+                continue
+            src = p.data.reshape(-1)[lo - ps : hi - ps]
+            self.data[lo - ms : hi - ms].copy_(src)
+
+    @torch.no_grad()
+    def copy_flat_to_model(self, full_flat: torch.Tensor | None = None) -> None:
+        """Write fp32 masters back into the (possibly fp16) params.
+
+        ``full_flat`` is a full buffer covering ``[0, numel_padded)`` (the
+        stage-3 gather result); by default ``self.data`` covering
+        ``master_range`` is used. Only the covered parameter elements are
+        touched, so stage 3 can refresh either the full params (while
+        gathered) or just the local placeholder slices (while free).
+        """
+        if full_flat is not None:
+            buf, base = full_flat, 0
+        else:
+            buf, base = self.data, self.master_range[0]
+        end = base + buf.numel()
+        for (offset, p), n in zip(self._offsets, self._numels):
+            ps, pe = self._pdata_range(offset, n, p)
+            lo, hi = max(ps, base), min(pe, end)
+            if lo >= hi:
+                continue
+            dst = p.data.view(-1)[lo - ps : hi - ps]
+            dst.copy_(buf[lo - base : hi - base])
+
+    # --------------------------------------------------------- stage 3 params
+    @torch.no_grad()
+    def partition_params(self) -> None:
+        """ZeRO-3: keep only this rank's master shard and replace each
+        parameter's data with its locally-owned slice.
+
+        Afterwards ``self.data`` has size ``shard_size`` and the model params
+        hold flat model-dtype placeholders; the full parameter tensors only
+        exist between :meth:`materialize_params` and
+        :meth:`dematerialize_params`.
+        """
+        if self._partitioned:
+            return
+        self.data = self.data[self.shard_start : self.shard_end].clone()
+        self._partitioned = True
+        self.dematerialize_params()
+        self.copy_flat_to_model()  # fill placeholders from the shard masters
+
+    @torch.no_grad()
+    def materialize_params(self) -> None:
+        """ZeRO-3 gather (step 1): allocate full-shaped parameter tensors
+        for :meth:`copy_flat_to_model` to fill."""
+        if not self._partitioned:
+            return
+        for (offset, p), shape in zip(self._offsets, self._shapes):
+            p.data = torch.empty(shape, dtype=p.data.dtype, device=p.data.device)
+
+    @torch.no_grad()
+    def dematerialize_params(self) -> None:
+        """ZeRO-3 free: params drop back to flat locally-owned placeholders."""
+        if not self._partitioned:
+            return
+        ms, me = self.shard_start, self.shard_end
+        for (offset, p), n in zip(self._offsets, self._numels):
+            lo, hi = max(offset, ms), min(offset + n, me)
+            p.data = torch.empty(
+                max(0, hi - lo), dtype=p.data.dtype, device=p.data.device
+            )
 
     # ------------------------------------------------------------------ grads
     @torch.no_grad()
@@ -90,18 +198,27 @@ class FlatParamGroup:
         """Copy ``param.grad`` (fp16/fp32) into the fp32 flat grad buffer.
 
         Parameters without gradients contribute zeros (e.g. frozen params).
+        The buffer is (re)allocated on demand — stage 3 drops it after every
+        reduce-scatter to keep the resident gradient at shard size.
         """
-        self.grad.zero_()
-        for offset, p in self._offsets:
+        if self.grad is None:
+            self.grad = torch.zeros(self.numel_padded, dtype=torch.float32,
+                                    device=self.data.device)
+        else:
+            self.grad.zero_()
+        for (offset, p), n in zip(self._offsets, self._numels):
             if p.grad is None:
                 continue
-            n = p.numel()
             self.grad[offset : offset + n].copy_(p.grad.data.reshape(-1))
             p.grad = None  # free the model-dtype gradient memory
 
     @torch.no_grad()
     def zero_grad(self) -> None:
-        self.grad.zero_()
+        if self.grad is not None:
+            if self.zero_stage >= 3:
+                self.grad = None  # free; rebuilt by flatten_grads()
+            else:
+                self.grad.zero_()
         if self.grad_shard is not None:
             self.grad_shard.zero_()
 
@@ -119,11 +236,13 @@ class FlatParamGroup:
     @property
     def shard(self) -> torch.Tensor:
         """This rank's slice of the fp32 parameter buffer."""
+        if self._partitioned:
+            return self.data  # stage 3: data *is* the shard
         return self.data[self.shard_start : self.shard_end]
 
     @torch.no_grad()
     def unscale_grads(self, scale: float) -> None:
-        if scale == 1.0:
+        if scale == 1.0 or self.grad is None:
             return
         self.grad.div_(scale)
 
@@ -134,7 +253,7 @@ class FlatParamGroup:
             return
         if self.grad_shard is not None:
             self.grad_shard.mul_(factor)
-        else:
+        elif self.grad is not None:
             self.grad.mul_(factor)
 
     def numel_shard(self) -> int:

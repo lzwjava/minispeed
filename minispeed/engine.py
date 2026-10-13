@@ -36,7 +36,7 @@ from .flat import FlatParamGroup, build_flat_groups
 from .optim import build_scheduler
 from .precision import DynamicLossScaler, global_overflow, has_overflow
 from .utils import Timers
-from .zero import ZeROOptimizer
+from .zero import build_zero_optimizer
 
 logger = logging.getLogger("minispeed")
 
@@ -123,8 +123,13 @@ class DeepSpeedEngine:
                 for p in g.params:
                     p.data = p.data.to(target)
 
+        # --- ZeRO-3: masters + params shrink to this rank's shard ------------
+        if self.config.zero_stage >= 3:
+            for g in self.flat_groups:
+                g.partition_params()
+
         # --- optimizer / scheduler / loss scaler ------------------------------
-        self.optimizer = ZeROOptimizer(
+        self.optimizer = build_zero_optimizer(
             self.flat_groups,
             option_groups,
             zero_stage=self.config.zero_stage,
@@ -193,6 +198,11 @@ class DeepSpeedEngine:
         return obj
 
     def forward(self, *args, **kwargs):
+        # ZeRO-3: parameters are partitioned between steps — all-gather them
+        # on demand (no-op for stages 0-2 / while already gathered).
+        if not self.optimizer.params_gathered:
+            with self.timers.timer("gather"):
+                self.optimizer.gather_parameters()
         return self.module(
             *self._cast_inputs(args), **self._cast_inputs(kwargs)
         )
@@ -270,6 +280,7 @@ class DeepSpeedEngine:
             self.loss_scaler.update(overflow=True)
             self.skipped_steps += 1
             self.optimizer.zero_grad()
+            self.optimizer.free_parameters()  # ZeRO-3: params back to shards
             if self.skipped_steps % max(1, self.config.steps_per_print) == 0:
                 logger.warning(
                     "rank %d: detected inf/nan gradients at micro_step=%d, "
@@ -297,9 +308,11 @@ class DeepSpeedEngine:
         )
 
         # 6) update this rank's shard and sync parameters across ranks
+        #    (stages 0-2: all-gather masters → model; stage 3: free the full
+        #     params — they are re-gathered from the updated masters at the
+        #     next forward)
         self.optimizer.step()
-        for g in self.flat_groups:
-            g.copy_flat_to_model()
+        self.optimizer.sync_parameters()
 
         # 7) bookkeeping
         self.loss_scaler.update(overflow=False)
@@ -322,9 +335,13 @@ class DeepSpeedEngine:
         return ckpt.load_checkpoint(self, load_dir, tag=tag, **kwargs)
 
     def state_dict(self):
+        # stage 3: parameters live as 1/N slices between steps — gather them
+        # so the returned tensors carry their real shapes (collective).
+        self.optimizer.gather_parameters()
         return self.module.state_dict()
 
     def load_state_dict(self, state_dict):
+        self.optimizer.gather_parameters()  # stage 3 needs full-shaped params
         self.module.load_state_dict(state_dict)
         for g in self.flat_groups:
             g.copy_model_to_flat()

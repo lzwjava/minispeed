@@ -7,6 +7,7 @@ accumulation, WarmupDecayLR, checkpoint save/resume and rank-0 logging.
 Single GPU::
 
     python examples/train_lm.py --dtype fp16 --zero 2
+    python examples/train_lm.py --dtype fp16 --zero 3   # params sharded too
 
 Multi-process (2 ranks share one GPU -> minispeed picks gloo automatically,
 2 GPUs -> NCCL)::
@@ -51,6 +52,7 @@ are few. all reduce the gradients, all gather the parameters, keep a master
 copy in full precision and let every rank remember only its own slice.
 the data flows in micro batches and the gradients meet in the middle.
 zero stage one shards the optimizer, stage two shards the gradients as well,
+stage three shards the weights and gathers them again for every forward pass,
 and the model keeps training as if there were no partitions at all.
 measure the timers, print the norm, save the checkpoint and resume tomorrow.
 the data flows in micro batches and the gradients meet in the middle.
@@ -179,7 +181,9 @@ def main() -> None:
                         help="gradient accumulation steps")
     parser.add_argument("--dtype", default="fp16",
                         choices=["fp32", "fp16", "bf16"])
-    parser.add_argument("--zero", type=int, default=2, choices=[0, 1, 2])
+    parser.add_argument("--zero", type=int, default=2, choices=[0, 1, 2, 3],
+                        help="ZeRO stage: 1 optimizer state, 2 + gradients, "
+                             "3 + parameters")
     parser.add_argument("--lr", type=float, default=3e-3)
     parser.add_argument("--warmup", type=int, default=30)
     parser.add_argument("--block-size", type=int, default=64)
